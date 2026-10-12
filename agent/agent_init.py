@@ -1126,10 +1126,14 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     # expose kanban_show interactively, and children/cron runs inherit the env var, without
     # owning a task.
     from agent.delegation_context import owned_kanban_task
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if owned_kanban_task() and "kanban_show" in agent.valid_tool_names else ""
-    )
+    from agent.prompt_builder import KANBAN_GUIDANCE, build_kanban_pinned_task
+    _owned_task = owned_kanban_task()
+    agent._kanban_worker_guidance = ""
+    if _owned_task and "kanban_show" in agent.valid_tool_names:
+        # Pin the card itself next to the protocol: compaction can stub the kanban_show
+        # result, but never the system prompt.
+        _pinned = build_kanban_pinned_task(_owned_task)
+        agent._kanban_worker_guidance = KANBAN_GUIDANCE + (f"\n\n{_pinned}" if _pinned else "")
     if agent.quiet_mode:
         return
     if agent.tools:

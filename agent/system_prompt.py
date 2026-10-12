@@ -287,8 +287,9 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
     # Kanban lifecycle: resolved once at __init__ (_kanban_worker_guidance);
     # fallback paths must also limit task protocol guidance to dispatcher workers.
     _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
-    if _kanban_guidance is None and "kanban_show" in names and owned_kanban_task():
-        _kanban_guidance = KANBAN_GUIDANCE
+    if _kanban_guidance is None and "kanban_show" in names and (_owned := owned_kanban_task()):
+        _pinned = _pb.build_kanban_pinned_task(_owned)
+        _kanban_guidance = KANBAN_GUIDANCE + (f"\n\n{_pinned}" if _pinned else "")
     tool_guidance = [
         memory_guidance,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,

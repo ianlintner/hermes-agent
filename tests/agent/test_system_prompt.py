@@ -981,3 +981,89 @@ class TestConversationStartedTwoLine:
         vol = self._volatile(agent)
         assert "Conversation started:" not in vol
         assert "as of the last context rebuild" not in vol
+
+
+def _seed_kanban_task(title="Bootstrap repo", body="Do the real work.\nAcceptance: tests pass."):
+    """Create one card on the sandboxed default board and return its id."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    conn = kbc.connect()
+    try:
+        return kb.create_task(conn, title=title, body=body, workspace_kind="worktree", branch_name="wt/pinned-task")
+    finally:
+        conn.close()
+
+
+def test_pinned_task_block_carries_card_title_and_body():
+    """The card survives compaction because it lives in the system prompt (never compacted)."""
+    from agent.prompt_builder import build_kanban_pinned_task
+
+    tid = _seed_kanban_task()
+    block = build_kanban_pinned_task(tid)
+
+    assert f"Task id: {tid}" in block
+    assert "Title: Bootstrap repo" in block
+    assert "Branch: wt/pinned-task" in block
+    assert "Do the real work.\nAcceptance: tests pass." in block
+    assert "kanban_complete" in block  # terminal-call reminder rides along
+
+
+def test_pinned_task_block_truncates_long_bodies_with_recovery_hint():
+    from agent.prompt_builder import build_kanban_pinned_task
+
+    tid = _seed_kanban_task(body="x" * 500)
+    block = build_kanban_pinned_task(tid, max_chars=100)
+
+    assert "x" * 100 in block and "x" * 101 not in block
+    assert "400 chars omitted; call kanban_show() for the full card" in block
+
+
+@pytest.mark.parametrize("task_id", ["", "t_missing"])
+def test_pinned_task_block_empty_when_card_unavailable(task_id):
+    from agent.prompt_builder import build_kanban_pinned_task
+
+    assert build_kanban_pinned_task(task_id) == ""
+
+
+def test_pinned_task_block_falls_back_when_board_unreadable(monkeypatch):
+    from agent.prompt_builder import build_kanban_pinned_task
+    from hermes_cli import kanban_db_connect as kbc
+
+    def boom(*_a, **_k):
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(kbc, "connect", boom)
+    assert build_kanban_pinned_task("t_any") == ""
+
+
+def test_agent_init_pins_owned_card_after_protocol(monkeypatch):
+    from agent.agent_init import _load_tools
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    import model_tools
+
+    tid = _seed_kanban_task()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kw: [{"function": {"name": "kanban_show"}}])
+    agent = SimpleNamespace(quiet_mode=True)
+
+    _load_tools(agent, enabled_toolsets=["kanban"], disabled_toolsets=None)
+
+    assert agent._kanban_worker_guidance.startswith(KANBAN_GUIDANCE)
+    assert f"Task id: {tid}" in agent._kanban_worker_guidance
+    assert "Do the real work." in agent._kanban_worker_guidance
+
+
+def test_inherited_task_env_does_not_pin_card(monkeypatch):
+    """A cron run / delegate child inheriting HERMES_KANBAN_TASK is not the owner: no card, no protocol."""
+    from agent.delegation_context import non_dispatcher_owned_context
+    from agent.system_prompt import _tool_guidance_block
+
+    tid = _seed_kanban_task()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    agent = _make_agent(valid_tool_names={"kanban_show"})
+    delattr(agent, "_kanban_worker_guidance")
+
+    with non_dispatcher_owned_context():
+        assert _tool_guidance_block(agent) is None
