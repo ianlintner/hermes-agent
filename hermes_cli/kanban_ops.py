@@ -58,6 +58,8 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    # kanban.spawn_commands maps non-profile assignees to worker commands.
+    spawn_commands = None
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
@@ -78,7 +80,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
+        spawn_commands = _kanban_cfg.get("spawn_commands")
     except Exception:
+        spawn_commands = None
         default_assignee = max_in_progress_per_profile = max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kbc.connect_closing() as conn:
@@ -90,6 +94,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            spawn_commands=spawn_commands,
         )
     if getattr(args, "json", False):
         _print_json({

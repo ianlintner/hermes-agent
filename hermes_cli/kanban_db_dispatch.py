@@ -1720,6 +1720,20 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     return _gated
 
 
+def _resolve_spawn_commands(raw: Optional[Mapping[str, Any]] = None) -> dict[str, list[str]]:
+    """Validate ``kanban.spawn_commands`` once per tick, reading config when unset."""
+    from hermes_cli.kanban_spawn_commands import configured_spawn_commands, resolve_spawn_commands
+    if raw is None:
+        return configured_spawn_commands()
+    return resolve_spawn_commands(raw)
+
+
+def _spawnable_with_commands(name: str, profile_exists: Optional[Callable[[str], bool]],
+                             commands: Mapping[str, list[str]]) -> bool:
+    """A configured command makes an assignee spawnable even without a profile."""
+    return name in commands or (profile_exists is None or bool(profile_exists(name)))
+
+
 def _dispatch_profile_allowlist(normalize_profile_name) -> Optional[frozenset]:
     """Per-home claim allowlist ``kanban.dispatch_profiles`` (#110995).
 
@@ -1788,7 +1802,8 @@ def dispatch_profile_allowlist_summary() -> str:
             "profile, or the config could not be read — omit the key to allow any)")
 
 
-def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
+def _has_spawnable(conn: sqlite3.Connection, status: str,
+                    commands: Optional[Mapping[str, list[str]]] = None) -> bool:
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
@@ -1796,11 +1811,12 @@ def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     ).fetchall()
     if not rows:
         return False
+    commands = commands if commands is not None else _resolve_spawn_commands()
     profile_exists = _profile_exists_fn()
     if profile_exists is None:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    return any(_spawnable_with_commands(row["assignee"], profile_exists, commands) for row in rows)
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
@@ -1991,6 +2007,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    spawn_commands: Optional[Mapping[str, list[str]]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2014,6 +2031,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            spawn_commands=spawn_commands,
         )
 
     try:
@@ -2063,6 +2081,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    spawn_commands: Mapping[str, list[str]],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2074,7 +2093,9 @@ def _dispatch_lane_task(
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
     # it by assigning a profile, and health telemetry suppresses "stuck" for it.
     profile_exists = _profile_exists_fn()
-    if profile_exists is not None and not profile_exists(assignee):
+    if not _spawnable_with_commands(
+        assignee, profile_exists, spawn_commands if lane != "review" else {}
+    ):
         result.skipped_nonspawnable.append(task_id)
         # Per-task diagnostic so ``show``/``tail`` name the missing profile instead of leaving
         # the card in ``ready`` with zero board evidence (#122422). Unlike a respawn guard the
@@ -2148,7 +2169,13 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        chosen_spawn_fn = spawn_fn
+        if chosen_spawn_fn is None and lane != "review" and assignee in spawn_commands:
+            from hermes_cli.kanban_spawn_commands import make_command_spawn
+            chosen_spawn_fn = make_command_spawn(spawn_commands[assignee])
+        if chosen_spawn_fn is None:
+            chosen_spawn_fn = _default_spawn
+        pid = _call_spawn_fn(chosen_spawn_fn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2335,6 +2362,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    spawn_commands: Optional[Mapping[str, list[str]]] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2342,6 +2370,7 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    spawn_commands = _resolve_spawn_commands(spawn_commands)
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
@@ -2390,6 +2419,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        spawn_commands=spawn_commands,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0

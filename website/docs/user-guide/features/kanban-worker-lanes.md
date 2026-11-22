@@ -44,7 +44,19 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 | `HERMES_PROFILE` | the worker's own profile name (for `kanban_comment` author attribution) |
 | `HERMES_TENANT` | tenant namespace, if the task has one |
 
-For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spawn_fn` callable that gets `task`, `workspace`, and `board` and returns an optional pid for crash detection.
+For non-Hermes lanes, configure `kanban.spawn_commands` (see [Adding an external CLI worker lane](#adding-an-external-cli-worker-lane)); the dispatcher starts the command itself and records its PID as for a profile worker. A plugin can also register its own `spawn_fn` callable that gets `task`, `workspace`, and `board` and returns an optional pid for crash detection.
+
+### Config-mapped command lanes
+
+```yaml
+kanban:
+  spawn_commands:
+    remote-hub: "/home/me/bin/lane run --task {task_id} --board {board}"
+```
+
+Each key is an assignee name; each value is a command template (string, split with `shlex.split`, or an already-split list). Placeholders: `{task_id}`, `{workspace}`, `{board}`, `{run_id}`. Substitution happens inside each argv element after splitting: a task id or path containing spaces or shell metacharacters stays one argument. There is **no shell** — the command runs with `shell=False` in the task's workspace. Invalid or empty templates are reported once per config load and that assignee stays non-spawnable; they never raise into a tick.
+
+An assignee with a valid `spawn_commands` entry is spawnable **without** being a Hermes profile, but its command *is* the worker: it must heartbeat and finish the card through the kanban API or CLI exactly as a profile worker does. It receives the task/board/run-id PID pins (`HERMES_KANBAN_*`) on a secrets-scrubbed dispatcher environment, and gets provider credentials from its own configuration — never from a Hermes profile scope. The scrubber removes names it recognises as provider or Hermes-managed secrets, but the command inherits any other dispatcher environment variable by name; keep unrelated secrets out of the dispatcher's environment or unset them in the command's wrapper. If a name is both a profile and a `spawn_commands` key, the configured command wins. Leave the key absent or empty to keep the previous behaviour (non-profile assignees are `skipped_nonspawnable`; profile workers use `_default_spawn`). Stale-claim, crash, runtime, respawn-guard and concurrency handling apply to mapped workers unchanged.
 
 ### Descendant process scope
 
@@ -118,7 +130,7 @@ A specialisation of the profile lane: an orchestrator is a Hermes profile whose 
 
 ## Adding an external CLI worker lane
 
-Wiring a non-Hermes CLI tool (Codex CLI, Claude Code CLI, OpenCode CLI, a local coding-model runner, etc.) as a kanban worker lane is *not yet a paved path*. The dispatcher's spawn function is pluggable (`spawn_fn` is a parameter on `dispatch_once`), and a plugin could register its own `spawn_fn` for a non-Hermes assignee, but the surrounding integration work — wrapping the CLI's exit code into `kanban_complete` / `kanban_block` calls, mapping the CLI's workspace/sandbox conventions onto the dispatcher's `HERMES_KANBAN_WORKSPACE` env, handling auth and per-CLI policy — is still per-integration design work.
+Wiring a non-Hermes CLI tool (Codex CLI, Claude Code CLI, OpenCode CLI, a local coding-model runner, etc.) as a kanban worker lane is now supported with `kanban.spawn_commands` (above): the dispatcher starts the configured command on its own tick, under the same caps and lifecycle handling as a profile worker. Wrapping the CLI's exit code into `kanban_complete` / `kanban_block` calls, mapping the CLI's workspace conventions onto `HERMES_KANBAN_WORKSPACE`, and handling auth remain per-integration responsibilities.
 
 If you're considering adding a CLI lane, open an issue describing the specific CLI and the workflow you're trying to enable. The contract above is the constraints any such lane must satisfy; the implementation shape (one plugin per CLI vs a generic CLI-runner plugin parameterised by config) is open.
 
