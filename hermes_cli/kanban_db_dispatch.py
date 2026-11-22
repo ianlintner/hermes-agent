@@ -444,13 +444,23 @@ def _terminate_reclaimed_worker(
     *,
     signal_fn=None,
     started_at=None,
+    run_id: Optional[int] = None,
+    task_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
     fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
     signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
     UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
     it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
-    spawning a duplicate beside it."""
+    spawning a duplicate beside it.
+
+    Once the worker is gone (or proven gone), its Docker container is removed by card id + run id.
+    Both are required: ``task_runs.id`` is a per-board counter, so a run id alone can match a live
+    container on another board sharing this Docker daemon. The worker's atexit hook cannot do this
+    reliably: its SIGTERM handler hard-exits and SIGKILL skips atexit. Container cleanup is bounded
+    and best-effort; it runs before this function returns and outside any database write transaction
+    opened by the caller.
+    """
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
@@ -464,6 +474,20 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    try:
+        return _terminate_host_local_worker(info, pid, claim_lock, signal_fn=signal_fn, started_at=started_at)
+    finally:
+        # A live worker that survived termination keeps its container: never remove containers for a
+        # run that is still ours. Filtering on card id + run id keeps a respawn on any board safe.
+        if run_id and task_id and info.get("terminated"):
+            from hermes_cli.kanban_docker_cleanup import remove_kanban_run_containers
+            info["containers_removed"] = remove_kanban_run_containers(task_id, run_id)
+
+
+def _terminate_host_local_worker(
+    info: dict[str, Any], pid: int, claim_lock: Optional[str], *, signal_fn=None, started_at=None,
+) -> dict[str, Any]:
+    """Signal a verified host-local worker; caller owns container cleanup."""
     kill = _kill_fn(signal_fn)
     if kill is None:
         return info
@@ -537,9 +561,14 @@ def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: li
     termination = None
     if alive:
         termination = _terminate_reclaimed_worker(
-            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint)
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=fingerprint,
+            run_id=row["id"], task_id=row["task_id"])
         if not termination["terminated"]:
             return  # still alive: try again next tick
+    else:
+        # SIGKILL/OOM exit bypassed the worker's atexit cleanup.
+        from hermes_cli.kanban_docker_cleanup import remove_kanban_run_containers
+        remove_kanban_run_containers(row["task_id"], row["id"])
     with _kb.write_txn(conn):
         conn.execute(
             "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
@@ -655,6 +684,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "       r.id AS run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -698,6 +728,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _poll_worker_exit(pid, started_at)
             if _worker_alive(pid, started_at):
                 killed = _sigkill(kill, pid)
+
+            if not _worker_alive(pid, started_at) and _kb._row_get(row, "run_id"):
+                from hermes_cli.kanban_docker_cleanup import remove_kanban_run_containers
+                remove_kanban_run_containers(tid, _kb._row_get(row, "run_id"))
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -772,6 +806,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "       t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -798,7 +833,8 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"),
+            run_id=_kb._row_get(row, "current_run_id"), task_id=tid)
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -1160,6 +1196,9 @@ class _CrashSweep:
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
     exited_hook_payloads: list[dict] = field(default_factory=list)
+    # Runs whose worker is dead; container removal runs after the reclaim txn commits.
+    # Each entry is (card id, run id) so a same-run-id container on another board is spared.
+    container_identities: list[tuple[str, int]] = field(default_factory=list)
 
 
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
@@ -1212,6 +1251,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 metadata=dict(dead.event_payload),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
+            if run_id is not None:
+                sweep.container_identities.append((row["id"], run_id))
             sweep.exited_hook_payloads.append({
                 "task_id": row["id"],
                 "assignee": row["assignee"],
@@ -1331,6 +1372,12 @@ def detect_crashed_workers(conn: sqlite3.Connection, board: Optional[str] = None
     ``_last_rate_limited`` attribute (the return stays crashed-only).
     """
     sweep = _reclaim_dead_workers(conn, board=board)
+    # Outside every write txn; a dead worker's atexit hook never ran, so its container
+    # can still be running. Reaping by card id + closed run id cannot touch a respawn
+    # on this or any other board sharing the Docker daemon.
+    from hermes_cli.kanban_docker_cleanup import remove_kanban_run_containers
+    for dead_task_id, dead_run_id in sweep.container_identities:
+        remove_kanban_run_containers(dead_task_id, dead_run_id)
     # Outside the main txn: account each crash and maybe trip the breaker.
     auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
     # Side-channel attributes keep the public ``list[str]`` return stable;

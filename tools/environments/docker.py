@@ -55,6 +55,32 @@ _ENVIRONMENT_LABEL_KEY = "hermes-environment"
 # stopped on purpose; ``hermes-task-id`` cannot serve, it is truncated to 63 chars.
 _WORKSPACE_LABEL_KEY = "hermes-workspace"
 _WORKSPACE_TASK_RE = re.compile(r":ws:([0-9a-f]{16})$")
+# Kanban workers stamp their card id + run id so the dispatcher can remove the container
+# after killing a worker whose atexit hook never ran. Run ids are per-board counters, so the
+# card id (a host-unique random ``t_<hex>``) is required alongside it. Interactive/gateway/cron
+# sessions have neither marker and carry no such labels.
+_KANBAN_RUN_LABEL_KEY = "hermes-kanban-run"
+_KANBAN_TASK_LABEL_KEY = "hermes-kanban-task"
+
+
+def _kanban_labels(persist_across_processes: bool = True) -> dict[str, str]:
+    """Card + run labels for a session-scoped kanban worker, or {} otherwise.
+
+    Both parts must be present: a partial identity would allow a same-run-id
+    container on another board to be removed by mistake. Persistent containers
+    are shared across processes and must never carry a per-run kill label.
+    """
+    task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    raw_run = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not task or not raw_run.isdigit():
+        return {}
+    # A persistent container is shared by gateway/CLI/cron/session runs via
+    # _attach_existing_container(); one run's labels would mark that shared
+    # sandbox for removal when the run is reaped. Only session-scoped containers
+    # (container_persistent: false) may carry a kill label.
+    if persist_across_processes:
+        return {}
+    return {_KANBAN_TASK_LABEL_KEY: task, _KANBAN_RUN_LABEL_KEY: raw_run}
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -754,6 +780,10 @@ class DockerEnvironment(BaseEnvironment):
             _EGRESS_LABEL_KEY: egress_label}
         if workspace := _WORKSPACE_TASK_RE.search(task_id or ""):
             self._labels[_WORKSPACE_LABEL_KEY] = workspace.group(1)
+        # Only session-scoped containers are stamped with per-run kill labels; a
+        # persistent container is shared with other sessions and must not become
+        # removable when one run is reaped.
+        self._labels.update(_kanban_labels(persist_across_processes))
         # Explicit sharing opts into the first creator's settings. Otherwise,
         # changed image/mount/home configuration must start a fresh container.
         if not shared_container_key:
